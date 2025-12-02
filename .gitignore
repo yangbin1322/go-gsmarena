@@ -1,0 +1,42 @@
+# 二进制文件
+go-gsmarena
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试文件
+*.test
+*.out
+
+# 数据库文件
+*.db
+crawler.db
+
+# 输出文件
+results.jsonl
+*.jsonl
+
+# 日志文件
+*.log
+
+# Go 依赖
+vendor/
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# 临时文件
+tmp/
+temp/
