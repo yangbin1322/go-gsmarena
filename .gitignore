@@ -1,5 +1,6 @@
 # 二进制文件
 go-gsmarena
+gsmarena
 *.exe
 *.exe~
 *.dll
