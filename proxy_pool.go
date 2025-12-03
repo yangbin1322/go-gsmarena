@@ -14,13 +14,14 @@ import (
 // ProxyManager 动态代理池管理器
 // 负责从 API 获取代理、维护健康代理列表、实现故障剔除和自动补货
 type ProxyManager struct {
-	apiURL       string       // 代理 API 地址
-	minThreshold int          // 最低存活代理数量阈值
-	proxies      []string     // 代理列表 (格式: "http://IP:Port")
-	lock         sync.RWMutex // 读写锁，保证并发安全
-	currentIndex int          // Round-Robin 轮询索引
-	isRefreshing bool         // 是否正在刷新代理（防止并发刷新）
-	refreshLock  sync.Mutex   // 刷新操作的互斥锁
+	apiURL          string       // 代理 API 地址
+	minThreshold    int          // 最低存活代理数量阈值
+	proxies         []string     // 代理列表 (格式: "http://IP:Port")
+	lock            sync.RWMutex // 读写锁，保证并发安全
+	currentIndex    int          // Round-Robin 轮询索引
+	isRefreshing    bool         // 是否正在刷新代理（防止并发刷新）
+	refreshLock     sync.Mutex   // 刷新操作的互斥锁
+	requestProxyMap sync.Map     // map[string]string (timestamp -> proxy)
 }
 
 // NewProxyManager 创建新的代理管理器实例
@@ -95,13 +96,13 @@ func (pm *ProxyManager) fetchProxies() error {
 		}
 	}
 
-	// 更新代理池（加写锁）
+	// 追加更新代理池（加写锁）
 	pm.lock.Lock()
-	pm.proxies = newProxies
-	pm.currentIndex = 0 // 重置索引
+	pm.proxies = append(pm.proxies, newProxies...) // 追加
+	pm.currentIndex = 0
 	pm.lock.Unlock()
 
-	log.Printf("代理池更新成功，新增 %d 个代理", len(newProxies))
+	log.Printf("代理池更新成功，当前共 %d 个代理", len(pm.proxies))
 	return nil
 }
 
@@ -168,7 +169,30 @@ func (pm *ProxyManager) GetProxy(r *http.Request) (*url.URL, error) {
 		return nil, fmt.Errorf("解析代理 URL 失败: %w", err)
 	}
 
+	//分配代理，记录请求使用的代理
+	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+	r.Header.Set("X-Request-Timestamp", requestID)
+	pm.requestProxyMap.Store(requestID, proxyStr)
 	return proxyURL, nil
+}
+
+// ⭐ GetRequestProxy 通过 Request ID 获取使用的代理
+func (pm *ProxyManager) GetRequestProxy(requestID string) string {
+	if requestID == "" {
+		return ""
+	}
+
+	if proxy, ok := pm.requestProxyMap.Load(requestID); ok {
+		return proxy.(string)
+	}
+	return ""
+}
+
+// ⭐ CleanupRequest 清理请求记录
+func (pm *ProxyManager) CleanupRequest(requestID string) {
+	if requestID != "" {
+		pm.requestProxyMap.Delete(requestID)
+	}
 }
 
 // asyncRefresh 异步刷新代理池（防止重复刷新）
