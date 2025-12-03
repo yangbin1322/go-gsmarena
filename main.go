@@ -24,6 +24,13 @@ func init() {
 
 }
 
+// Brand 品牌数据结构
+type Brand struct {
+	Name         string // 品牌名称
+	URL          string // 品牌页面 URL
+	DevicesCount int    // 设备数量
+}
+
 // Phone 手机数据结构
 type Phone struct {
 	ModelName   string            `json:"model_name"`   // 手机型号名称
@@ -95,23 +102,21 @@ func main() {
 	}
 	defer outputFile.Close()
 
-	// 4. 创建 Colly 爬虫实例
-	c := createCollector()
+	// ========== 阶段 1: 获取品牌列表 ==========
+	log.Println("========== 阶段 1: 获取品牌列表 ==========")
+	brands := fetchBrandList()
+	log.Printf("品牌列表获取完成，共 %d 个品牌", len(brands))
 
-	// 5. 设置回调函数
-	setupCallbacks(c)
+	// ========== 阶段 2: 获取所有手机链接 ==========
+	log.Println("========== 阶段 2: 获取所有手机链接 ==========")
+	phoneLinks := fetchPhoneLinks(brands)
+	log.Printf("手机链接获取完成，共 %d 个手机链接", len(phoneLinks))
 
-	// 6. 启动爬虫
-	log.Println("开始抓取 GSMArena 数据...")
-	startURL := "https://www.gsmarena.com/makers.php3"
-	if err := c.Visit(startURL); err != nil {
-		log.Printf("访问起始页面失败: %v", err)
-	}
+	// ========== 阶段 3: 获取手机详情 ==========
+	log.Println("========== 阶段 3: 获取手机详情 ==========")
+	fetchPhoneDetails(phoneLinks)
 
-	// 7. 等待所有异步请求完成
-	c.Wait()
-
-	// 8. 输出统计信息
+	// 4. 输出统计信息
 	printStats()
 
 	log.Println("========== 爬虫任务完成 ==========")
@@ -166,107 +171,76 @@ func createCollector() *colly.Collector {
 	return c
 }
 
-// setupCallbacks 设置 Colly 回调函数
-func setupCallbacks(c *colly.Collector) {
-	// OnRequest: 请求发送前
-	c.OnRequest(func(r *colly.Request) {
+// fetchBrandList 阶段1: 获取所有品牌列表
+func fetchBrandList() []Brand {
+	brands := make([]Brand, 0)
+	var brandsMutex sync.Mutex
 
-		log.Printf("[请求] %s ", r.URL)
-	})
+	c := createCollector()
 
-	// OnError: 请求失败处理（核心：代理剔除 + 重试）
-	c.OnError(func(r *colly.Response, err error) {
-		statusCode := r.StatusCode
-		requestURL := r.Request.URL.String()
-		proxyURL := r.Request.ProxyURL
+	// 设置通用错误处理
+	setupErrorHandler(c)
 
-		log.Printf("[错误] URL=%s, StatusCode=%d, Error=%v, Proxy=%s",
-			requestURL, statusCode, err, proxyURL)
-
-		// 判断是否需要剔除代理并重试
-		shouldRetry := false
-
-		switch {
-		case statusCode == 0:
-			log.Printf("[网络错误] StatusCode=0，需要重试: %v", err)
-			shouldRetry = true
-
-		case statusCode == 404:
-			// 404 不重试，但标记为已访问防止死循环
-			log.Printf("[404] 页面不存在，跳过: %s", requestURL)
-			_ = storage.MarkVisited(requestURL)
-
-		case statusCode == 403 || statusCode == 429 || statusCode == 503:
-			// 403/429/503: 代理被封禁或限流
-			log.Printf("[风控] 状态码 %d，剔除代理并重试", statusCode)
-			shouldRetry = true
-
-		case err != nil && (strings.Contains(err.Error(), "timeout") ||
-			strings.Contains(err.Error(), "connection refused") ||
-			strings.Contains(err.Error(), "EOF")):
-			// 超时或连接失败
-			log.Printf("[超时/连接失败] 剔除代理并重试")
-			shouldRetry = true
-
-		default:
-			// 其他错误，记录但不重试
-			log.Printf("[其他错误] 不重试: %v", err)
-		}
-
-		// 执行代理剔除和重试
-		if shouldRetry {
-			if proxyURL != "" {
-				proxyManager.RemoveProxy(proxyURL)
-			}
-			// 重新入队请求（Colly 会自动使用新代理）
-			if err := r.Request.Retry(); err != nil {
-				log.Printf("[重试失败] %s: %v", requestURL, err)
-			} else {
-				log.Printf("[已重试] %s", requestURL)
-			}
-		}
-	})
-
-	// OnHTML: 品牌列表页 (makers.php3)
+	// 解析品牌列表页
 	c.OnHTML(".st-text a", func(e *colly.HTMLElement) {
-
-		// 品牌 URL（相对路径 -> 绝对路径）
 		brandURL := e.Request.AbsoluteURL(e.Attr("href"))
-
-		// 品牌名在 `<a>` 的文本第一行
 		brandName := strings.TrimSpace(e.DOM.Contents().First().Text())
-
-		// 设备数量在 <span> 里面："113 devices"
 		devicesText := strings.TrimSpace(e.DOM.Find("span").Text())
 
-		// 只取数字（例如 "113 devices" → 113）
 		devicesCount := 0
 		fmt.Sscanf(devicesText, "%d", &devicesCount)
 
-		log.Printf("[品牌] %s | %d devices | %s",
-			brandName, devicesCount, brandURL)
+		log.Printf("[品牌] %s | %d devices | %s", brandName, devicesCount, brandURL)
 
-		// 访问该品牌详情页
-		if brandURL != "" {
-			e.Request.Visit(brandURL)
-		}
+		brandsMutex.Lock()
+		brands = append(brands, Brand{
+			Name:         brandName,
+			URL:          brandURL,
+			DevicesCount: devicesCount,
+		})
+		brandsMutex.Unlock()
 	})
 
-	// OnHTML: 品牌手机列表页
+	// 访问品牌列表页
+	startURL := "https://www.gsmarena.com/makers.php3"
+	if err := c.Visit(startURL); err != nil {
+		log.Printf("访问品牌列表页失败: %v", err)
+	}
+
+	c.Wait()
+	return brands
+}
+
+// fetchPhoneLinks 阶段2: 获取所有手机链接
+func fetchPhoneLinks(brands []Brand) []string {
+	phoneLinks := make([]string, 0)
+	var linksMutex sync.Mutex
+
+	c := createCollector()
+
+	// 设置通用错误处理
+	setupErrorHandler(c)
+
+	// 解析手机列表页
 	c.OnHTML(".makers", func(e *colly.HTMLElement) {
 		// 提取手机详情页链接
 		e.ForEach("li a", func(_ int, el *colly.HTMLElement) {
 			phoneURL := el.Request.AbsoluteURL(el.Attr("href"))
 
-			// 去重检查：如果已访问过，跳过
-			if storage.IsVisited(phoneURL) {
-				log.Printf("[跳过] 已访问: %s", phoneURL)
-				return
+			linksMutex.Lock()
+			// 简单去重
+			isDuplicate := false
+			for _, link := range phoneLinks {
+				if link == phoneURL {
+					isDuplicate = true
+					break
+				}
 			}
-
-			// 访问详情页
-			log.Printf("[发现] 手机详情页: %s", phoneURL)
-			el.Request.Visit(phoneURL)
+			if !isDuplicate {
+				phoneLinks = append(phoneLinks, phoneURL)
+				log.Printf("[发现] 手机链接 #%d: %s", len(phoneLinks), phoneURL)
+			}
+			linksMutex.Unlock()
 		})
 
 		// 翻页：查找 "Next" 按钮
@@ -279,21 +253,32 @@ func setupCallbacks(c *colly.Collector) {
 		})
 	})
 
-	// OnHTML: 手机详情页解析
-	c.OnHTML(".specs-phone-name-title, #specs-list", func(e *colly.HTMLElement) {
-		if e.Request.URL.Path == "/makers.php3" {
-			return // 跳过品牌列表页
+	// 访问所有品牌页面
+	for i, brand := range brands {
+		log.Printf("[进度] 正在获取品牌 %d/%d: %s", i+1, len(brands), brand.Name)
+		if err := c.Visit(brand.URL); err != nil {
+			log.Printf("访问品牌页面失败 %s: %v", brand.URL, err)
 		}
+	}
 
-		// 检查是否为详情页（包含规格表）
-		if e.Attr("id") != "specs-list" {
-			return
-		}
+	c.Wait()
+	return phoneLinks
+}
 
+// fetchPhoneDetails 阶段3: 获取所有手机详情
+func fetchPhoneDetails(phoneLinks []string) {
+	c := createCollector()
+
+	// 设置通用错误处理
+	setupErrorHandler(c)
+
+	// 解析手机详情页
+	c.OnHTML("#specs-list", func(e *colly.HTMLElement) {
 		phoneURL := e.Request.URL.String()
 
-		// 再次检查去重（防止并发重复抓取）
+		// 去重检查
 		if storage.IsVisited(phoneURL) {
+			log.Printf("[跳过] 已访问: %s", phoneURL)
 			return
 		}
 
@@ -301,7 +286,7 @@ func setupCallbacks(c *colly.Collector) {
 		modelName := e.DOM.ParentsUntil("body").Find(".specs-phone-name-title").Text()
 		modelName = strings.TrimSpace(modelName)
 
-		// 提取品牌（从 URL 推断）
+		// 提取品牌
 		brand := extractBrandFromURL(phoneURL)
 
 		// 提取规格参数
@@ -337,19 +322,81 @@ func setupCallbacks(c *colly.Collector) {
 		if err := storage.MarkVisited(phoneURL); err != nil {
 			log.Printf("[错误] 标记 URL 失败: %v", err)
 		} else {
-			log.Printf("[成功] 已抓取并标记: %s", phoneURL)
+			log.Printf("[成功] 已抓取: %s", modelName)
+		}
+	})
+
+	// 访问所有手机详情页
+	for i, phoneURL := range phoneLinks {
+		if storage.IsVisited(phoneURL) {
+			log.Printf("[跳过] 已访问 #%d/%d: %s", i+1, len(phoneLinks), phoneURL)
+			continue
+		}
+		log.Printf("[进度] 正在获取手机 %d/%d", i+1, len(phoneLinks))
+		if err := c.Visit(phoneURL); err != nil {
+			log.Printf("访问手机详情页失败: %v", err)
+		}
+	}
+
+	c.Wait()
+}
+
+// setupErrorHandler 设置通用的错误处理和重试逻辑
+func setupErrorHandler(c *colly.Collector) {
+	// OnRequest: 请求发送前
+	c.OnRequest(func(r *colly.Request) {
+		log.Printf("[请求] %s", r.URL)
+	})
+
+	// OnError: 请求失败处理
+	c.OnError(func(r *colly.Response, err error) {
+		statusCode := r.StatusCode
+		requestURL := r.Request.URL.String()
+		proxyURL := r.Request.ProxyURL
+
+		log.Printf("[错误] URL=%s, StatusCode=%d, Error=%v, Proxy=%s",
+			requestURL, statusCode, err, proxyURL)
+
+		shouldRetry := false
+
+		switch {
+		case statusCode == 0:
+			log.Printf("[网络错误] StatusCode=0，需要重试: %v", err)
+			shouldRetry = true
+
+		case statusCode == 404:
+			log.Printf("[404] 页面不存在，跳过: %s", requestURL)
+			_ = storage.MarkVisited(requestURL)
+
+		case statusCode == 403 || statusCode == 429 || statusCode == 503:
+			log.Printf("[风控] 状态码 %d，剔除代理并重试", statusCode)
+			shouldRetry = true
+
+		case err != nil && (strings.Contains(err.Error(), "timeout") ||
+			strings.Contains(err.Error(), "connection refused") ||
+			strings.Contains(err.Error(), "EOF")):
+			log.Printf("[超时/连接失败] 剔除代理并重试")
+			shouldRetry = true
+
+		default:
+			log.Printf("[其他错误] 不重试: %v", err)
+		}
+
+		if shouldRetry {
+			if proxyURL != "" {
+				proxyManager.RemoveProxy(proxyURL)
+			}
+			if err := r.Request.Retry(); err != nil {
+				log.Printf("[重试失败] %s: %v", requestURL, err)
+			} else {
+				log.Printf("[已重试] %s", requestURL)
+			}
 		}
 	})
 
 	// OnResponse: 响应成功
 	c.OnResponse(func(r *colly.Response) {
-		log.Printf("[响应] %s (状态码: %d, 大小: %d bytes)",
-			r.Request.URL, r.StatusCode, len(r.Body))
-	})
-
-	// OnScraped: 页面抓取完成
-	c.OnScraped(func(r *colly.Response) {
-		log.Printf("[完成] %s", r.Request.URL)
+		log.Printf("[响应] %s (状态码: %d)", r.Request.URL, r.StatusCode)
 	})
 }
 
